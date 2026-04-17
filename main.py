@@ -17,9 +17,8 @@ TG_BASE = f"https://api.telegram.org/bot{TG_TOKEN}"
 HEADERS = {"X-Auth-Token": FD_TOKEN}
 ZURICH  = pytz.timezone("Europe/Zurich")
 
-# TIMING
-MAX_MINUTE_ERSTE_WAHL = 80   # Alerts bis Minute 80
-GRENZE_WETT_WECHSEL   = 60   # Ab dieser Minute: Over 0.5 statt Over 1.5
+MAX_MINUTE          = 80
+GRENZE_WETT_WECHSEL = 60
 
 # ═══════════════════════════════════════
 # LIGEN
@@ -38,17 +37,17 @@ LEAGUES = {
 # ═══════════════════════════════════════
 # STATE
 # ═══════════════════════════════════════
-standings_cache  = {}   # {league_code: {team_id: rank}}
-alerted_matches  = set()
-prev_scores      = {}   # {match_id: {"home": x, "away": y}}
-match_start_time = {}   # {match_id: datetime} — fuer Minuten-Fallback
+standings_cache = {}
+alerted_matches = set()
+prev_scores     = {}
+team_stats_cache = {}  # {team_id: {form, avg_goals, avg_goals_home, avg_goals_away}}
 
 # ═══════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════
 def send_telegram(text):
     if not TG_TOKEN:
-        print(f"[TELEGRAM N/A] {text[:80]}")
+        print(f"[TELEGRAM N/A]\n{text}")
         return
     try:
         r = requests.post(
@@ -61,39 +60,121 @@ def send_telegram(text):
         else:
             print(f"❌ Telegram {r.status_code}: {r.text[:100]}")
     except Exception as e:
-        print(f"❌ Telegram Exception: {e}")
+        print(f"❌ Telegram: {e}")
 
 # ═══════════════════════════════════════
 # MINUTE ERMITTELN
-# Primaer:  match["minute"] aus der API
-# Fallback: Berechnung aus Spielstart-Zeit
 # ═══════════════════════════════════════
 def get_minute(match):
-    match_id = match["id"]
-
-    # Primaer: API-Feld "minute"
     api_minute = match.get("minute")
-    if api_minute and api_minute > 0:
+    if api_minute and int(api_minute) > 0:
         return int(api_minute)
-
-    # Fallback: aus utcDate berechnen
     utc_date_str = match.get("utcDate")
     if utc_date_str:
         try:
-            utc = pytz.utc
+            utc   = pytz.utc
             start = datetime.strptime(utc_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
-            now   = datetime.now(utc)
-            diff  = (now - start).total_seconds() / 60
-            # Halbzeit-Puffer (15 Min) ab Minute 45
+            diff  = (datetime.now(utc) - start).total_seconds() / 60
             if diff > 45:
-                diff = diff - 15
-            minute = max(1, min(90, int(diff)))
-            return minute
+                diff -= 15
+            return max(1, min(90, int(diff)))
         except Exception:
             pass
-
-    # Letzter Fallback: 1 (besser als 0)
     return 1
+
+# ═══════════════════════════════════════
+# TEAM STATS LADEN (Form + Tore/Spiel)
+# ═══════════════════════════════════════
+def get_team_stats(team_id, team_name):
+    # Cache prüfen (max 6h alt)
+    cached = team_stats_cache.get(team_id)
+    if cached and (time.time() - cached["ts"]) < 21600:
+        return cached
+
+    stats = {
+        "ts":              time.time(),
+        "form":            "?????",
+        "avg_goals":       0.0,
+        "avg_home_goals":  0.0,
+        "avg_away_goals":  0.0,
+        "games_played":    0,
+    }
+
+    try:
+        r = requests.get(
+            f"{FD_BASE}/teams/{team_id}/matches?status=FINISHED&limit=10",
+            headers=HEADERS, timeout=10
+        )
+        if r.status_code == 200:
+            matches = r.json().get("matches", [])
+            if not matches:
+                team_stats_cache[team_id] = stats
+                return stats
+
+            # Form (letzte 5)
+            form_chars = []
+            total_goals_list = []
+            home_goals_list  = []
+            away_goals_list  = []
+
+            for m in matches[:10]:
+                h_score = m["score"]["fullTime"].get("home") or 0
+                a_score = m["score"]["fullTime"].get("away") or 0
+                total_goals_list.append(h_score + a_score)
+
+                is_home = m["homeTeam"]["id"] == team_id
+                if is_home:
+                    home_goals_list.append(h_score + a_score)
+                    if h_score > a_score:   form_chars.append("W")
+                    elif h_score == a_score: form_chars.append("D")
+                    else:                    form_chars.append("L")
+                else:
+                    away_goals_list.append(h_score + a_score)
+                    if a_score > h_score:   form_chars.append("W")
+                    elif a_score == h_score: form_chars.append("D")
+                    else:                    form_chars.append("L")
+
+            # Form-Emojis (letzte 5)
+            def to_emoji(c):
+                return "🟢" if c == "W" else ("⚪" if c == "D" else "🔴")
+
+            form_5    = form_chars[:5]
+            form_str  = " ".join(to_emoji(c) for c in form_5)
+            form_text = " ".join(form_5)  # W W D L W
+
+            stats["form"]           = form_str
+            stats["form_text"]      = form_text
+            stats["avg_goals"]      = round(sum(total_goals_list) / len(total_goals_list), 1) if total_goals_list else 0.0
+            stats["avg_home_goals"] = round(sum(home_goals_list)  / len(home_goals_list),  1) if home_goals_list  else 0.0
+            stats["avg_away_goals"] = round(sum(away_goals_list)  / len(away_goals_list),  1) if away_goals_list  else 0.0
+            stats["games_played"]   = len(matches)
+
+            print(f"  📊 {team_name}: Form {form_text} | Ø {stats['avg_goals']} Tore/Spiel")
+
+        elif r.status_code == 429:
+            print(f"  ⚠️ Team Stats Rate-Limit für {team_name}")
+            time.sleep(8)
+        else:
+            print(f"  ❌ Team Stats {team_name}: HTTP {r.status_code}")
+
+    except Exception as e:
+        print(f"  ❌ Team Stats {team_name}: {e}")
+
+    team_stats_cache[team_id] = stats
+    return stats
+
+# ═══════════════════════════════════════
+# HALBZEIT KONTEXT
+# ═══════════════════════════════════════
+def get_halfzeit_context(minute):
+    if minute <= 45:
+        verbleibend = 45 - minute
+        if verbleibend <= 7:
+            return f"⚠️ 1. HZ — nur noch ~{verbleibend}' bis Pause (Riegel-Risiko!)"
+        else:
+            return f"1. Halbzeit ({verbleibend}' bis Pause)"
+    else:
+        return f"2. Halbzeit"
 
 # ═══════════════════════════════════════
 # SIGNALSTAERKE
@@ -107,72 +188,103 @@ def get_signal(diff, minute, tier):
         return "⭐ SCHWACH"
 
 # ═══════════════════════════════════════
-# KELLER vs KELLER CHECK
+# KELLER vs. KELLER
 # ═══════════════════════════════════════
-def is_bottom_vs_bottom(home_rank, away_rank, total_teams):
-    bottom_4 = total_teams - 3
-    return home_rank >= bottom_4 and away_rank >= bottom_4
+def is_bottom_vs_bottom(home_rank, away_rank, total):
+    return home_rank >= (total - 3) and away_rank >= (total - 3)
 
 # ═══════════════════════════════════════
-# ALERT SENDEN
+# WETT-EMPFEHLUNG JE NACH MINUTE
+# ═══════════════════════════════════════
+def get_wett_info(minute):
+    if minute > GRENZE_WETT_WECHSEL:
+        left = 80 - minute
+        return {
+            "empfehlung": "LIVE Over 0.5 weitere Tore",
+            "deadline":   f"⏰ Over 0.5 → noch {left}' möglich (bis Min 80)",
+            "hinweis":    "⚠️ Spätes Tor — 1 weiteres Tor reicht"
+        }
+    else:
+        left_15 = GRENZE_WETT_WECHSEL - minute
+        left_05 = 80 - minute
+        return {
+            "empfehlung": "LIVE Over 1.5 Tore",
+            "deadline":   (
+                f"⏰ Over 1.5 → noch {left_15}' möglich (bis Min 60)\n"
+                f"   Over 0.5 → noch {left_05}' möglich (bis Min 80)"
+            ),
+            "hinweis":    ""
+        }
+
+# ═══════════════════════════════════════
+# ALERT AUFBAUEN UND SENDEN
 # ═══════════════════════════════════════
 def send_alert(match, scorer_team, home_rank, away_rank, minute, league_code):
-    league     = LEAGUES[league_code]
-    home_name  = match["homeTeam"]["name"]
-    away_name  = match["awayTeam"]["name"]
-    home_score = match["score"]["fullTime"]["home"]
-    away_score = match["score"]["fullTime"]["away"]
-    diff       = abs(home_rank - away_rank)
-    signal     = get_signal(diff, minute, league["tier"])
+    league    = LEAGUES[league_code]
+    home_name = match["homeTeam"]["name"]
+    away_name = match["awayTeam"]["name"]
+    home_id   = match["homeTeam"]["id"]
+    away_id   = match["awayTeam"]["id"]
+    score     = match["score"]["fullTime"]
+    diff      = abs(home_rank - away_rank)
+    signal    = get_signal(diff, minute, league["tier"])
+    wett      = get_wett_info(minute)
+    halbzeit  = get_halfzeit_context(minute)
 
-    # Ab Minute 61: Over 0.5 (noch 1 weiteres Tor noetig)
-    # Bis Minute 60: Over 1.5 (noch 2 weitere Tore noetig)
-    if minute > GRENZE_WETT_WECHSEL:
-        wett_empfehlung = "LIVE Over 0.5 weitere Tore"
-        deadline_left   = 90 - minute
-        deadline_text   = f"⏰ {minute}' — noch {deadline_left}' bis Spielende"
-        wett_hinweis    = "⚠️ Spaetes Tor — nur Over 0.5 empfohlen"
-    else:
-        wett_empfehlung = "LIVE Over 1.5 Tore ab jetzt"
-        deadline_left   = 80 - minute
-        deadline_text   = f"⏰ {minute}' — noch {deadline_left}' bis Deadline (Min 80)"
-        wett_hinweis    = ""
+    # Team-Stats laden (2 extra Calls)
+    time.sleep(6)   # Rate-limit schützen
+    home_stats = get_team_stats(home_id, home_name)
+    time.sleep(6)
+    away_stats = get_team_stats(away_id, away_name)
+
+    # Tore-Kontext: Heim-Ø zuhause, Away-Ø auswärts
+    home_avg = home_stats.get("avg_home_goals") or home_stats.get("avg_goals", 0)
+    away_avg = away_stats.get("avg_away_goals") or away_stats.get("avg_goals", 0)
+    avg_combined = round((home_avg + away_avg) / 2, 1)
+    tore_bewertung = "🔥 Torreich" if avg_combined >= 2.5 else ("⚖️ Mittel" if avg_combined >= 1.8 else "🧱 Torarm")
 
     if scorer_team == "away":
-        head  = "🟢 <b>ERSTE WAHL — LIVE ALERT</b>"
-        trig  = f"🎯 Trigger:   {away_name} erzielte 1. Tor"
-        rang  = f"📈 Rang-Diff: {diff} Plätze (Away schlechter)"
-        extra = ""
+        header   = "🟢 <b>ERSTE WAHL — LIVE ALERT</b>"
+        trigger  = f"🎯 {away_name} erzielte das 1. Tor"
+        rang_txt = f"📈 Rang-Diff:  {diff} Plätze  (Away schlechter)"
+        extra    = ""
     else:
-        head  = "🟡 <b>ZWEITE WAHL — LIVE ALERT</b>"
-        trig  = f"🎯 Trigger:   {home_name} erzielte 1. Tor"
-        rang  = f"📈 Rang-Diff: {diff} Plätze (Heim schlechter)"
-        extra = "⚡ Heimteam ist schlechter platziert\n"
+        header   = "🟡 <b>ZWEITE WAHL — LIVE ALERT</b>"
+        trigger  = f"🎯 {home_name} erzielte das 1. Tor"
+        rang_txt = f"📈 Rang-Diff:  {diff} Plätze  (Heim schlechter)"
+        extra    = "⚡ Heimteam ist schlechter platziert\n"
 
     text = (
-        f"{head}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 Liga:      {league['name']}  {league['tier_str']}\n"
-        f"⚽ Spiel:     {home_name} {home_score}–{away_score} {away_name}\n"
-        f"⏱ Minute:    {minute}'\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{trig}\n"
+        f"{header}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 Liga:       {league['name']}  {league['tier_str']}\n"
+        f"⚽ Spiel:      {home_name} {score['home']}–{score['away']} {away_name}\n"
+        f"⏱ Minute:     {minute}'  |  {halbzeit}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{trigger}\n"
         f"{extra}"
-        f"📊 Tabelle:   Heim Platz {home_rank}  |  Away Platz {away_rank}\n"
-        f"{rang}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Wette:     {wett_empfehlung}\n"
-        f"🔥 Signal:    {signal}\n"
-        f"📉 Liga HR:   {league['hit_rate']}%\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Tabelle:    Heim Platz {home_rank}  |  Away Platz {away_rank}\n"
+        f"{rang_txt}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 FORM (letzte 5 Spiele):\n"
+        f"   {home_name[:18]}: {home_stats.get('form', '?????')}\n"
+        f"   {away_name[:18]}: {away_stats.get('form', '?????')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚽ TORE/SPIEL (Saison):\n"
+        f"   {home_name[:18]}: Ø {home_avg} (Heimspiele)\n"
+        f"   {away_name[:18]}: Ø {away_avg} (Auswärtsspiele)\n"
+        f"   Tendenz: {tore_bewertung}  (Ø {avg_combined})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Wette:      {wett['empfehlung']}\n"
+        f"🔥 Signal:     {signal}\n"
+        f"📉 Liga HR:    {league['hit_rate']}%\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
     )
-    if wett_hinweis:
-        text += f"{wett_hinweis}\n"
-    text += deadline_text
+    if wett["hinweis"]:
+        text += f"{wett['hinweis']}\n"
+    text += wett["deadline"]
 
-    print(f"\n{'='*55}")
-    print(text)
-    print(f"{'='*55}\n")
+    print(f"\n{'='*55}\n{text}\n{'='*55}\n")
     send_telegram(text)
 
 # ═══════════════════════════════════════
@@ -185,20 +297,17 @@ def load_standings(league_code):
             headers=HEADERS, timeout=15
         )
         if r.status_code == 200:
-            data  = r.json()
             ranks = {}
-            for standing in data.get("standings", []):
-                if standing.get("type") == "TOTAL":
-                    for entry in standing.get("table", []):
-                        ranks[entry["team"]["id"]] = entry["position"]
+            for s in r.json().get("standings", []):
+                if s.get("type") == "TOTAL":
+                    for e in s.get("table", []):
+                        ranks[e["team"]["id"]] = e["position"]
             standings_cache[league_code] = ranks
             print(f"  ✅ {LEAGUES[league_code]['name']}: {len(ranks)} Teams")
             return len(ranks)
         elif r.status_code == 429:
-            print(f"  ⚠️ {league_code}: Rate-limit — kurz warten")
+            print(f"  ⚠️ {league_code} Rate-limit")
             time.sleep(12)
-        else:
-            print(f"  ❌ {league_code}: HTTP {r.status_code}")
     except Exception as e:
         print(f"  ❌ {league_code}: {e}")
     return 0
@@ -207,96 +316,72 @@ def load_all_standings():
     print(f"\n[{now_str()}] Lade Tabellenränge...")
     for code in LEAGUES:
         load_standings(code)
-        time.sleep(7)   # Rate-limit: max 10 req/min
+        time.sleep(7)
 
 # ═══════════════════════════════════════
-# KERN-LOGIK: MATCH PRUEFEN
+# MATCH PRÜFEN
 # ═══════════════════════════════════════
 def check_match(match):
-    match_id = match["id"]
-
-    if match.get("status") not in ["IN_PLAY", "PAUSED"]:
-        return
-
+    match_id    = match["id"]
+    status      = match.get("status", "")
     league_code = match.get("competition", {}).get("code", "")
-    if league_code not in LEAGUES:
-        return
 
-    if match_id in alerted_matches:
-        return
+    if status not in ["IN_PLAY", "PAUSED"]: return
+    if league_code not in LEAGUES:          return
+    if match_id in alerted_matches:         return
 
-    # Minute ermitteln (mit Fallback)
     minute = get_minute(match)
-
-    # Deadline: bis Minute 80
-    if minute > MAX_MINUTE_ERSTE_WAHL:
+    if minute > MAX_MINUTE:
         alerted_matches.add(match_id)
         return
 
-    # Score
     score      = match.get("score", {})
     home_score = score.get("fullTime", {}).get("home") or 0
     away_score = score.get("fullTime", {}).get("away") or 0
 
-    # Vorheriger Stand
     prev      = prev_scores.get(match_id, {"home": 0, "away": 0})
     prev_home = prev["home"]
     prev_away = prev["away"]
     prev_scores[match_id] = {"home": home_score, "away": away_score}
 
-    # Kein Tor
-    if home_score == prev_home and away_score == prev_away:
-        return
-
-    # Nur das ERSTE Tor (Stand muss vorher 0:0 gewesen sein)
+    if home_score == prev_home and away_score == prev_away: return
     if prev_home != 0 or prev_away != 0:
         alerted_matches.add(match_id)
         return
 
-    # Wer hat getroffen?
-    if   home_score == 1 and away_score == 0:
-        scorer_team = "home"
-    elif away_score == 1 and home_score == 0:
-        scorer_team = "away"
-    else:
-        return
+    if   home_score == 1 and away_score == 0: scorer_team = "home"
+    elif away_score == 1 and home_score == 0: scorer_team = "away"
+    else: return
 
-    # Tabellenraenge
     standings = standings_cache.get(league_code, {})
-    if not standings:
-        print(f"  [SKIP] Keine Standings fuer {league_code}")
-        return
+    if not standings: return
 
-    home_id   = match.get("homeTeam", {}).get("id")
-    away_id   = match.get("awayTeam", {}).get("id")
+    home_id   = match["homeTeam"]["id"]
+    away_id   = match["awayTeam"]["id"]
     home_rank = standings.get(home_id, 99)
     away_rank = standings.get(away_id, 99)
     total     = len(standings)
     diff      = abs(home_rank - away_rank)
 
-    # Sperr-Regeln
     if diff < 3:
-        print(f"  [SKIP] Rang-Diff zu klein ({diff})")
         alerted_matches.add(match_id)
         return
     if is_bottom_vs_bottom(home_rank, away_rank, total):
-        print(f"  [SKIP] Keller vs Keller ({home_rank} vs {away_rank})")
         alerted_matches.add(match_id)
         return
 
-    # Trigger pruefen
-    heim  = match['homeTeam']['name']
-    away  = match['awayTeam']['name']
+    heim = match["homeTeam"]["name"]
+    away = match["awayTeam"]["name"]
+
     if scorer_team == "away" and away_rank > home_rank:
-        print(f"  🟢 ERSTE WAHL: {heim} vs {away} — Min {minute}' Diff {diff}")
+        print(f"  🟢 ERSTE WAHL: {heim} vs {away} Min {minute}' Diff {diff}")
         send_alert(match, "away", home_rank, away_rank, minute, league_code)
         alerted_matches.add(match_id)
     elif scorer_team == "home" and home_rank > away_rank:
-        print(f"  🟡 ZWEITE WAHL: {heim} vs {away} — Min {minute}' Diff {diff}")
+        print(f"  🟡 ZWEITE WAHL: {heim} vs {away} Min {minute}' Diff {diff}")
         send_alert(match, "home", home_rank, away_rank, minute, league_code)
         alerted_matches.add(match_id)
     else:
-        print(f"  [SKIP] Tor vom besseren Team ({heim} vs {away})")
         alerted_matches.add(match_id)
 
 # ═══════════════════════════════════════
@@ -304,18 +389,13 @@ def check_match(match):
 # ═══════════════════════════════════════
 def fetch_live_matches():
     try:
-        r = requests.get(
-            f"{FD_BASE}/matches?status=IN_PLAY",
-            headers=HEADERS, timeout=15
-        )
+        r = requests.get(f"{FD_BASE}/matches?status=IN_PLAY", headers=HEADERS, timeout=15)
         if r.status_code == 200:
             return r.json().get("matches", [])
-        else:
-            print(f"  ❌ Live Matches: HTTP {r.status_code}")
-            return []
+        print(f"  ❌ Live Matches: HTTP {r.status_code}")
     except Exception as e:
         print(f"  ❌ Live Matches: {e}")
-        return []
+    return []
 
 # ═══════════════════════════════════════
 # HILFSFUNKTIONEN
@@ -324,71 +404,59 @@ def now_str():
     return datetime.now(ZURICH).strftime("%H:%M:%S")
 
 def should_poll():
-    h = datetime.now(ZURICH).hour
-    return 11 <= h <= 23
+    return 11 <= datetime.now(ZURICH).hour <= 23
 
 def send_startup():
-    text = (
-        "🚀 <b>Fussball Alert Bot gestartet!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ 8 Ligen aktiv:\n"
-        "  Premier League, Bundesliga, La Liga\n"
-        "  Serie A, Ligue 1, Eredivisie\n"
-        "  Championship, Primeira Liga\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ Polling: alle 10 Sekunden\n"
-        f"🎯 Alerts: Erstes Tor bis Minute {MAX_MINUTE_ERSTE_WAHL}\n"
-        f"💰 Wette: Over 1.5 bis Min {GRENZE_WETT_WECHSEL} | Over 0.5 bis Min {MAX_MINUTE_ERSTE_WAHL}"
+    send_telegram(
+        "🚀 <b>Fussball Alert Bot v3.0 gestartet!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ 8 Ligen aktiv überwacht\n"
+        "📋 Form + Tore/Spiel in jedem Alert\n"
+        f"🎯 Alerts: Erstes Tor bis Minute {MAX_MINUTE}\n"
+        f"💰 Over 1.5 bis Min {GRENZE_WETT_WECHSEL}  |  Over 0.5 bis Min {MAX_MINUTE}"
     )
-    send_telegram(text)
 
 # ═══════════════════════════════════════
 # HAUPTSCHLEIFE
 # ═══════════════════════════════════════
 def main():
     print(f"\n{'='*55}")
-    print(f"  FUSSBALL ALERT BOT — v2.0")
-    print(f"  {now_str()}  |  Max Minute: {MAX_MINUTE_ERSTE_WAHL}")
-    print(f"  Over 1.5 bis Min {GRENZE_WETT_WECHSEL} | Over 0.5 bis Min {MAX_MINUTE_ERSTE_WAHL}")
+    print(f"  FUSSBALL ALERT BOT v3.0")
+    print(f"  {now_str()}")
     print(f"{'='*55}\n")
 
     send_startup()
     load_all_standings()
 
-    last_standings_refresh = time.time()
-    polling_active         = False
+    last_refresh   = time.time()
+    polling_active = False
 
     print(f"\n[{now_str()}] Hauptschleife startet...\n")
 
     while True:
-        now_ts = time.time()
-
-        # Standings alle 12 Stunden neu laden
-        if now_ts - last_standings_refresh > 43200:
+        if time.time() - last_refresh > 43200:
             load_all_standings()
-            last_standings_refresh = now_ts
+            last_refresh = time.time()
 
         if not should_poll():
             if polling_active:
-                print(f"[{now_str()}] Ausserhalb Spielzeit — Agent schlaeft")
+                print(f"[{now_str()}] Ausserhalb Spielzeit — Agent schläft")
                 polling_active = False
             time.sleep(60)
             continue
 
         polling_active = True
-        matches        = fetch_live_matches()
+        matches = fetch_live_matches()
 
         if matches:
             relevant = [m for m in matches if m.get("competition", {}).get("code") in LEAGUES]
             if relevant:
                 print(f"[{now_str()}] {len(relevant)} Spiele live:", end=" ")
                 for m in relevant:
-                    h   = m['homeTeam']['name'][:12]
-                    a   = m['awayTeam']['name'][:12]
-                    hs  = m['score']['fullTime']['home']
-                    as_ = m['score']['fullTime']['away']
                     min_ = get_minute(m)
-                    print(f"{h} {hs}:{as_} {a} ({min_}')", end=" | ")
+                    hs   = m["score"]["fullTime"]["home"]
+                    as_  = m["score"]["fullTime"]["away"]
+                    print(f"{m['homeTeam']['name'][:10]} {hs}:{as_} {m['awayTeam']['name'][:10]} ({min_}')", end=" | ")
                 print()
                 for match in relevant:
                     check_match(match)
